@@ -1,0 +1,15 @@
+
+# WhisperX bundles alignment helpers; it depends on `whisper` and `torch`.
+# WhisperX bundles alignment helpers; it depends on `whisper` and `torch`.
+whisperx>=3.7.4
+openai-whisper>=20230314
+deep-translator>=1.8.1
+transformers>=4.30.0
+huggingface-hub>=0.16.4
+sentencepiece>=0.1.97
+argostranslate>=1.8.0
+requests>=2.28.0
+tqdm>=4.65.0
+safetensors>=0.3.0
+ffmpeg-python
+# Note: install `torch` separately with the proper wheel for your platform (see README).
