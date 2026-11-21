@@ -56,11 +56,6 @@ def main():
         print(f"\nManifest File: {manifest.filepath}")
         print(f"Last Updated: {manifest.data.get('last_updated', 'Never')}")
         
-        # 这里调用了 whisper_sizes 属性
-        if not hasattr(manifest, 'whisper_sizes'):
-            print("Error: ManifestManager invalid (code mismatch).")
-            return
-            
         print("\n[Whisper Sizes Available]")
         for s in manifest.whisper_sizes:
             print(f" - {s}")
@@ -73,11 +68,6 @@ def main():
     # --- INTERACTIVE MODE ---
     print(f'\nInteractive prefetch (Manifest: {manifest.data.get("last_updated", "Default")})')
     
-    # 再次检查属性是否存在，防止代码未更新
-    if not hasattr(manifest, 'whisper_sizes'):
-        print("Critical Error: ModelDownloader code is outdated. Please update model_downloader.py")
-        return
-
     sizes = manifest.whisper_sizes
     # 安全回退
     if not sizes: 
@@ -125,4 +115,7 @@ def main():
     print("\nDone.")
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as exc:
+        raise SystemExit(str(exc)) from None

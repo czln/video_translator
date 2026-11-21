@@ -1,11 +1,13 @@
 import argparse
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 import tempfile
-from typing import Optional, List, Dict
-from .model_downloader import ModelDownloader
+from pathlib import Path
 
-from .transcriber import transcribe
+from .model_downloader import ModelDownloader
+from .transcriber import transcribe_with_language
 from .translator import translate_segments
 from .srt import write_srt
 
@@ -16,58 +18,66 @@ except ImportError:
     ffmpeg = None
 
 
-def _cache_paths_for(input_path: str, model: str, target_lang: Optional[str] = None, src_lang: Optional[str] = None, translator_mode: Optional[str] = None, cache_dir: Optional[str] = None) -> Dict[str, str]:
-    """Return cache file paths. If `cache_dir` is provided, store caches there using the video's base name.
-
-    Otherwise default to using an absolute path next to the original file (legacy behavior).
-    """
-    src_tag = f".{src_lang}" if src_lang else ""
-    # Sanitize translator mode for filename (replace : or / with _)
-    mode_str = str(translator_mode).replace(':', '_').replace('/', '_') if translator_mode else ""
-    mode_tag = f".{mode_str}" if mode_str else ""
-
-    if cache_dir:
-        base_name = os.path.splitext(os.path.basename(input_path))[0]
-        transcript_cache = os.path.join(cache_dir, f"{base_name}.transcript{src_tag}.{model}.json")
-        translation_cache = None
-        if target_lang:
-            translation_cache = os.path.join(cache_dir, f"{base_name}.translated{src_tag}{mode_tag}.{target_lang}.{model}.json")
-    else:
-        base = os.path.abspath(input_path)
-        transcript_cache = f"{base}.transcript{src_tag}.{model}.json"
-        translation_cache = None
-        if target_lang:
-            translation_cache = f"{base}.translated{src_tag}{mode_tag}.{target_lang}.{model}.json"
-
-    return {"transcript": transcript_cache, "translation": translation_cache}
+def _source_version(path):
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()), "device": stat.st_dev, "inode": stat.st_ino,
+        "size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "ctime_ns": stat.st_ctime_ns,
+    }
 
 
-def _load_cache(path: str, input_path: str) -> Optional[dict]:
+def _cache_path(directory, input_path, kind, *key):
+    # JSON preserves boundaries between language, model and path components.
+    identity = json.dumps([str(input_path.resolve()), *key], ensure_ascii=True)
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    return directory / f"{input_path.stem[:40]}.{kind}.{digest}.json"
+
+
+def _load_cache(path, source):
     try:
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        # validate source mtime
-        src_mtime = os.path.getmtime(input_path)
-        if data.get('source_mtime') != src_mtime:
-            return None
-        return data
-    except Exception:
-        return None
-
-
-def _save_cache(path: str, input_path: str, payload: dict) -> None:
-    try:
-        # ensure parent directory exists
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-
-        payload_to_save = dict(payload)
-        payload_to_save['source_mtime'] = os.path.getmtime(input_path)
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(payload_to_save, f, ensure_ascii=False, indent=2)
-    except Exception:
+        with path.open(encoding="utf-8") as cache:
+            data = json.load(cache)
+        if data.get("source") == source and isinstance(data.get("segments"), list):
+            return data
+    except (OSError, ValueError, AttributeError):
         pass
+    return None
+
+
+def _save_cache(path, source, **payload):
+    # Publish a complete JSON file even if another process is using this cache.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False, encoding="utf-8") as cache:
+            temporary = Path(cache.name)
+            json.dump({"source": source, **payload}, cache, ensure_ascii=False)
+        os.replace(temporary, path)
+    except OSError as exc:
+        print(f"Could not save cache {path}: {exc}")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def _audio_for(input_path, cache_dir, source, force):
+    cached_audio = None
+    if cache_dir is not None:
+        key = hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest()[:24]
+        cached_audio = cache_dir / f"{input_path.stem[:40]}.{key}.audio.wav"
+        if not force and cached_audio.is_file() and cached_audio.stat().st_size:
+            print(f"Reusing cached audio: {cached_audio}")
+            yield str(cached_audio)
+            return
+
+    with tempfile.TemporaryDirectory(dir=cache_dir) as scratch:
+        wav = Path(scratch) / "audio.wav"
+        print("Extracting audio...")
+        extract_audio(str(input_path), str(wav))
+        if cached_audio is not None:
+            os.replace(wav, cached_audio)
+            wav = cached_audio
+        yield str(wav)
 
 
 def _resolve_device(device: str) -> str:
@@ -108,7 +118,7 @@ def extract_audio(video_path: str, out_audio_path: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(prog="video-translator")
-    parser.add_argument("input", help="Input video file")
+    parser.add_argument("input", nargs="?", help="Input video file")
     parser.add_argument("--model", "-m", default="small", help="Whisper model name (tiny, base, small, medium, large)")
     parser.add_argument("--transcriber", choices=["whisper", "whisperx", "mixed"], default="mixed", help="Transcriber backend to use: 'whisper', 'whisperx', or 'mixed' (default 'mixed')")
     parser.add_argument("--lang", "-l", default=None, help="Target language code (e.g., fr, es). If omitted, only transcribe.")
@@ -130,192 +140,78 @@ def main():
     parser.add_argument("--force", action='store_true', help="Force re-transcribe and re-translate, ignoring caches")
     args = parser.parse_args()
     
-    # -------------------------------------------------------------------------
-    # FIX: Apply HF Mirror environment variable immediately after parsing args
-    # This ensures transformers/whisperx use the mirror during execution.
-    # -------------------------------------------------------------------------
     if args.hf_mirror:
-        args.hf_mirror = args.hf_mirror.rstrip('/')
+        args.hf_mirror = args.hf_mirror.rstrip("/")
         os.environ["HF_ENDPOINT"] = args.hf_mirror
-        print(f"Hugging Face mirror set as: {args.hf_mirror}")
 
-    # Resolve device for M2M100 (convert 'auto' to actual device)
-    args.device = _resolve_device(args.device)
-
-    input_path = args.input
-    out_srt = args.output or os.path.splitext(input_path)[0] + (f'.{args.lang}.srt' if args.lang else '.srt')
-    # normalize/cache-dir: make absolute path and create if necessary
-    if args.cache_dir:
-        args.cache_dir = os.path.abspath(args.cache_dir)
-        try:
-            os.makedirs(args.cache_dir, exist_ok=True)
-        except Exception:
-            pass
-
-    # normalize model-cache-dir if provided
-    if args.model_cache_dir:
-        args.model_cache_dir = os.path.abspath(args.model_cache_dir)
-        try:
-            os.makedirs(args.model_cache_dir, exist_ok=True)
-        except Exception:
-            pass
-        # create subdirectories for clarity and print them
-        whisper_dir = os.path.join(args.model_cache_dir, 'whisper')
-        hf_dir = os.path.join(args.model_cache_dir, 'hugging_face')
-        try:
-            os.makedirs(whisper_dir, exist_ok=True)
-        except Exception:
-            pass
-        try:
-            os.makedirs(hf_dir, exist_ok=True)
-        except Exception:
-            pass
-        print(f"Model cache (root): {args.model_cache_dir}")
-        print(f" - Whisper cache: {whisper_dir}")
-        print(f" - Hugging Face cache: {hf_dir}")
-
-    # if user requested to prefetch models, do that and exit early
     if args.download_models:
         downloader = ModelDownloader(proxy=args.proxy, hf_mirror=args.hf_mirror)
-        root = args.model_cache_dir or os.path.abspath('./model-cache')
-        os.makedirs(root, exist_ok=True)
-        print(f"Prefetching models into: {root} (this may take a while)")
-        results = downloader.download_all_models(save_root=root, include_whisper=True, include_hf=True)
-        print("Prefetch results:")
-        for r in results:
-            print(" -", r)
-        print("Done. Exiting as --download-models was specified.")
+        root = os.path.abspath(args.model_cache_dir or "./model-cache")
+        try:
+            results = downloader.download_all_models(save_root=root, model_size=args.model)
+        except RuntimeError as exc:
+            parser.exit(1, f"{exc}\n")
+        for result in results:
+            print(" -", result)
         return
 
-    # prepare cache paths (include source language in cache name)
-    # include transcriber backend in cache key so different backends produce separate caches
-    model_cache_tag = f"{args.model}.{args.transcriber}"
-    caches = _cache_paths_for(input_path, model_cache_tag, args.lang, src_lang=args.src_lang, translator_mode=args.translator_mode, cache_dir=args.cache_dir)
+    if not args.input:
+        parser.error("input is required unless --download-models is set")
+    input_path = Path(args.input)
+    if not input_path.is_file():
+        parser.error(f"Input file does not exist: {input_path}")
+    suffix = f".{args.lang}.srt" if args.lang else ".srt"
+    out_srt = Path(args.output) if args.output else input_path.with_suffix(suffix)
+    if out_srt.exists() and input_path.samefile(out_srt):
+        parser.error("Output SRT must be a different file from the input video")
 
-    if args.cache_dir:
-        print(f"Using cache directory: {args.cache_dir}")
-
-    segments = None
-
-    # try loading transcript cache
-    if not args.force:
-        tcache = caches.get('transcript')
-        if tcache and os.path.exists(tcache):
-            data = _load_cache(tcache, input_path)
-            if data and 'segments' in data:
-                print('Loaded transcript from cache:', tcache)
-                segments = data['segments']
-                # normalize segments: ensure each is a dict and has string 'text'
-                normalized = []
-                for seg in segments:
-                    if not isinstance(seg, dict):
-                        seg = {'start': 0.0, 'end': 0.0, 'text': str(seg or '')}
-                    # ensure text is string
-                    txt = seg.get('text')
-                    if txt is None:
-                        seg['text'] = ''
-                    else:
-                        seg['text'] = str(txt)
-                    normalized.append(seg)
-                segments = normalized
-
-    # Determine audio cache path: prefer storing audio in `--cache-dir` so ffmpeg
-    # extraction can be skipped on subsequent runs for the same video.
-    created_temp_audio = False
-    if args.cache_dir:
-        base_name = os.path.splitext(os.path.basename(input_path))[0]
-        audio_path = os.path.join(args.cache_dir, f"{base_name}.audio.wav")
-    else:
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-            audio_path = tmp.name
-        created_temp_audio = True
-
-    try:
-        if segments is None:
-            # If audio already exists in cache, skip extraction.
-            if os.path.exists(audio_path):
-                print(f"Reusing cached audio: {audio_path}")
-            else:
-                print('Extracting audio...')
-                extract_audio(input_path, audio_path)
-
-            print('Transcribing audio (this may take a while)...')
-            segments, used_device = transcribe(
-                audio_path,
-                model_name=args.model,
-                language=args.src_lang,
-                device=args.device,
-                model_cache_dir=args.model_cache_dir,
-                mode=args.transcriber,
+    source = _source_version(input_path)
+    cache_dir = Path(args.cache_dir).resolve() if args.cache_dir else None
+    if cache_dir:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_parent = cache_dir or input_path.parent
+    args.device = _resolve_device(args.device)
+    asr_key = (args.model, args.transcriber, args.src_lang)
+    transcript_path = _cache_path(cache_parent, input_path, "transcript", *asr_key)
+    transcript = None if args.force else _load_cache(transcript_path, source)
+    if transcript is None:
+        with _audio_for(input_path, cache_dir, source, args.force) as audio:
+            print("Transcribing audio...")
+            segments, device, detected = transcribe_with_language(
+                audio, model_name=args.model, language=args.src_lang, device=args.device,
+                model_cache_dir=args.model_cache_dir, mode=args.transcriber,
             )
-            print(f"Using device: {used_device}")
+        print(f"Using device: {device}")
+        _save_cache(transcript_path, source, segments=segments, language=detected)
+    else:
+        print(f"Loaded transcript from cache: {transcript_path}")
+        segments = transcript["segments"]
+        detected = transcript.get("language")
 
-            # save transcript cache
-            tcache = caches.get('transcript')
-            if tcache:
-                _save_cache(tcache, input_path, {'segments': segments, 'model': args.model, 'device': args.device})
-
-        if args.lang:
-            # try loading translation cache
-            translated = None
-            if not args.force:
-                trcache = caches.get('translation')
-                if trcache and os.path.exists(trcache):
-                    data = _load_cache(trcache, input_path)
-                    if data and 'segments' in data and data.get('target_lang') == args.lang:
-                        print('Loaded translation from cache:', trcache)
-                        translated = data['segments']
-                        # normalize translated segments to ensure 'translated_text' is string
-                        normalized = []
-                        for seg in translated:
-                            if not isinstance(seg, dict):
-                                seg = {'start': 0.0, 'end': 0.0, 'translated_text': str(seg or '')}
-                            ttxt = seg.get('translated_text')
-                            if ttxt is None:
-                                seg['translated_text'] = ''
-                            else:
-                                seg['translated_text'] = str(ttxt)
-                            # also ensure 'text' exists as string for fallback
-                            txt = seg.get('text')
-                            if txt is None:
-                                seg['text'] = ''
-                            else:
-                                seg['text'] = str(txt)
-                            normalized.append(seg)
-                        translated = normalized
-
-            if translated is None:
-                print(f'Translating to {args.lang}...')
-                try:
-                    translated = translate_segments(
-                        segments,
-                        args.lang,
-                        mode=args.translator_mode,
-                        proxy=args.proxy,
-                        timeout=args.timeout,
-                        src_lang=args.src_lang,
-                        auto_install=args.auto_install_argos,
-                        device=args.device,
-                        model_cache_dir=args.model_cache_dir,
-                    )
-                except RuntimeError as e:
-                    print('Error during translation:', e)
-                    print('Aborting.')
-                    raise SystemExit(1)
-                trcache = caches.get('translation')
-                if trcache:
-                    _save_cache(trcache, input_path, {'segments': translated, 'target_lang': args.lang, 'model': args.model, 'translator_mode': args.translator_mode, 'device': args.device})
-
-            write_srt(translated, out_srt, use_translated=True)
+    if args.lang:
+        language = args.src_lang
+        if language is None and args.translator_mode.lower() not in ("online", "google"):
+            language = detected
+        translation_path = _cache_path(cache_parent, input_path, "translated", *asr_key,
+                                       language, args.translator_mode, args.lang)
+        # A forced transcription can change the wording or timing for the same source.
+        cues = [(seg.get("start"), seg.get("end"), seg.get("text")) for seg in segments]
+        transcript_digest = hashlib.sha256(json.dumps(cues).encode()).hexdigest()
+        translation = None if args.force else _load_cache(translation_path, source)
+        if translation is None or translation.get("transcript_digest") != transcript_digest:
+            print(f"Translating to {args.lang}...")
+            try:
+                segments = translate_segments(
+                    segments, args.lang, mode=args.translator_mode, proxy=args.proxy,
+                    timeout=args.timeout, src_lang=language, auto_install=args.auto_install_argos,
+                    device=args.device, model_cache_dir=args.model_cache_dir,
+                )
+            except RuntimeError as exc:
+                parser.exit(1, f"Error during translation: {exc}\n")
+            _save_cache(translation_path, source, segments=segments, transcript_digest=transcript_digest)
         else:
-            write_srt(segments, out_srt, use_translated=False)
+            print(f"Loaded translation from cache: {translation_path}")
+            segments = translation["segments"]
 
-        print('Done. Output:', out_srt)
-
-    finally:
-        # Only remove the audio file if it was a temporary file; preserve cached audio.
-        try:
-            if created_temp_audio and os.path.exists(audio_path):
-                os.remove(audio_path)
-        except Exception:
-            pass
+    write_srt(segments, out_srt, use_translated=bool(args.lang))
+    print(f"Done. Output: {out_srt}")

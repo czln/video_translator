@@ -1,16 +1,19 @@
-import os
 import json
+import os
+import re
 import time
-import requests
-from tqdm import tqdm
+from contextlib import contextmanager
+from copy import deepcopy
+from tempfile import TemporaryDirectory
 from urllib.parse import urlparse
-from typing import Iterable, List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional
 
 # NOTE: Do not import `huggingface_hub` at module scope,
 # otherwise it may initialize before we set environment variables and
 # the HF mirror/endpoint settings may not take effect.
 
 MANIFEST_FILENAME = "model_manifest.json"
+DEFAULT_TRANSLATION_REPO = "facebook/m2m100_418M"
 
 DEFAULT_MANIFEST = {
     "last_updated": None,
@@ -23,11 +26,10 @@ DEFAULT_MANIFEST = {
         "large-v2": "Systran/faster-whisper-large-v2",
         # large-v3 will be discovered via update, or handled by fallback logic
     },
-    "alignment_repos": [
-        "jonatasgrosman/wav2vec2-large-xlsr-53-english"
-    ],
+    # Additional snapshots beyond the default English model selected by WhisperX.
+    "alignment_repos": [],
     "translation_repos": [
-        "facebook/m2m100_418M",
+        DEFAULT_TRANSLATION_REPO,
         "facebook/m2m100_1.2B"
     ]
 }
@@ -45,19 +47,19 @@ class ManifestManager:
                     data = json.load(f)
                     # Simple validation: reset to default if the format is too old
                     if "whisper_map" not in data: 
-                        return DEFAULT_MANIFEST.copy()
+                        return deepcopy(DEFAULT_MANIFEST)
                     return data
             except Exception as e:
                 print(f"Warning: Failed to load manifest {self.filepath}: {e}")
-        return DEFAULT_MANIFEST.copy()
+        return deepcopy(DEFAULT_MANIFEST)
 
     def save(self):
-        try:
-            with open(self.filepath, 'w', encoding='utf-8') as f:
+        with TemporaryDirectory(dir=os.path.dirname(self.filepath) or '.') as scratch:
+            temporary = os.path.join(scratch, MANIFEST_FILENAME)
+            with open(temporary, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, indent=2)
-            print(f"Manifest saved to: {self.filepath}")
-        except Exception as e:
-            print(f"Error saving manifest: {e}")
+            os.replace(temporary, self.filepath)
+        print(f"Manifest saved to: {self.filepath}")
 
     def update_from_network(self, proxy: str = None, mirror: str = None):
         """Connect to the Hugging Face API to discover new models and update the manifest."""
@@ -65,59 +67,37 @@ class ManifestManager:
         
         # 1. Set environment variables (must be done before importing HfApi)
         if proxy:
-            os.environ["HTTP_PROXY"] = proxy
-            os.environ["HTTPS_PROXY"] = proxy
+            os.environ.update(http_proxy=proxy, https_proxy=proxy, HTTP_PROXY=proxy, HTTPS_PROXY=proxy)
         if mirror:
             mirror = mirror.rstrip('/')
             os.environ["HF_ENDPOINT"] = mirror
             print(f"Using Mirror: {mirror}")
 
-        try:
-            # 2. Delay imports until after environment is configured
-            from huggingface_hub import HfApi
-            api = HfApi()
+        from huggingface_hub import HfApi
+        api = HfApi()
 
-            # Update Faster-Whisper mappings
-            print("Searching for Systran/faster-whisper models...")
-            models = api.list_models(author="Systran", search="faster-whisper", limit=50)
-            
-            new_map = {}
-            for m in models:
-                # modelId example: "Systran/faster-whisper-large-v3"
-                if "faster-whisper-" in m.modelId:
-                    key = m.modelId.split("faster-whisper-")[-1]
-                    new_map[key] = m.modelId
-            
-            if new_map:
-                current_map = self.data.get("whisper_map", {})
-                current_map.update(new_map)
-                self.data["whisper_map"] = current_map
-                print(f"Updated Whisper map: {list(new_map.keys())}")
+        def model_ids(author, search, limit):
+            for model in api.list_models(author=author, search=search, limit=limit):
+                yield getattr(model, "id", None) or model.modelId
 
-            # Update M2M100 model list
-            print("Searching for facebook/m2m100 models...")
-            m2m_models = api.list_models(author="facebook", search="m2m100", limit=20)
-            new_m2m = []
-            for m in m2m_models:
-                if "m2m100" in m.modelId and "ggml" not in m.modelId.lower():
-                    new_m2m.append(m.modelId)
-            
-            if new_m2m:
-                self.data["translation_repos"] = sorted(list(set(new_m2m)))
-                print(f"Updated Translation repos: {len(new_m2m)} found.")
+        print("Searching for Systran/faster-whisper models...")
+        prefix = "Systran/faster-whisper-"
+        for repo in model_ids("Systran", "faster-whisper", 50):
+            if repo.startswith(prefix):
+                self.data["whisper_map"][repo[len(prefix):]] = repo
 
-            self.data["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            self.save()
-            print("Update successful!")
+        print("Searching for facebook/m2m100 models...")
+        discovered = {
+            repo for repo in model_ids("facebook", "m2m100", 20)
+            if "m2m100" in repo and "ggml" not in repo.lower()
+        }
+        if discovered:
+            self.data["translation_repos"] = [DEFAULT_TRANSLATION_REPO] + sorted(discovered - {DEFAULT_TRANSLATION_REPO})
 
-        except ImportError:
-            print("Error: `huggingface_hub` not installed.")
-        except Exception as e:
-            print(f"Error updating from network: {e}")
+        self.data["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.save()
+        print("Update successful!")
 
-    # --- Properties added previously when an error occurred ---
-    # These should remain indented inside the ManifestManager class
-    
     @property
     def whisper_map(self) -> Dict[str, str]:
         return self.data.get("whisper_map", DEFAULT_MANIFEST["whisper_map"])
@@ -133,7 +113,9 @@ class ManifestManager:
 
     @property
     def translation_repos(self) -> List[str]:
-        return self.data.get("translation_repos", DEFAULT_MANIFEST["translation_repos"])
+        repos = self.data.get("translation_repos", DEFAULT_MANIFEST["translation_repos"])
+        # Older generated manifests sorted 1.2B before the runtime default.
+        return sorted(repos, key=lambda repo: repo != DEFAULT_TRANSLATION_REPO)
 
     @property
     def alignment_repos(self) -> List[str]:
@@ -147,8 +129,7 @@ class ModelDownloader:
 
         # 设置环境变量
         if proxy:
-            os.environ["HTTP_PROXY"] = proxy
-            os.environ["HTTPS_PROXY"] = proxy
+            os.environ.update(http_proxy=proxy, https_proxy=proxy, HTTP_PROXY=proxy, HTTPS_PROXY=proxy)
         
         if hf_mirror:
             hf_mirror = hf_mirror.rstrip('/')
@@ -178,55 +159,52 @@ class ModelDownloader:
         os.makedirs(whisper_dir, exist_ok=True)
         os.makedirs(hf_dir, exist_ok=True)
 
-        # A. OpenAI Whisper
-        if include_openai_whisper:
-            try:
-                import whisper
-                print(f"Downloading OpenAI Whisper ({model_size})...")
-                model = whisper.load_model(model_size, download_root=whisper_dir)
-                del model
-                results.append(f"OpenAI Whisper: {model_size}")
-            except Exception as e:
-                print(f"Failed to download OpenAI Whisper: {e}")
+        failures = []
 
-        # Sections B/C/D use a shared helper function
-        
-        def _do_download(repo_id):
-            print(f"Downloading HF Repo: {repo_id}")
+        @contextmanager
+        def attempt(label):
+            print(f"Downloading {label}...")
             try:
-                # Delay import so HF_ENDPOINT is applied before using the HF API
+                yield
+            except Exception as exc:
+                failures.append(f"{label}: {exc}")
+
+        def download_snapshot(repo_id):
+            with attempt(repo_id):
                 from huggingface_hub import snapshot_download
-                path = snapshot_download(
-                    repo_id=repo_id, 
-                    cache_dir=hf_dir, 
-                    repo_type='model', 
-                    proxies=self.proxies,
-                    resume_download=True
-                )
-                results.append(path)
-            except Exception as ex:
-                print(f"Failed to download {repo_id}: {ex}")
-                results.append(None)
+                results.append(snapshot_download(repo_id=repo_id, cache_dir=hf_dir, repo_type="model"))
 
-        # B. Faster-Whisper
+        if include_openai_whisper:
+            label = f"OpenAI Whisper: {model_size}"
+            with attempt(label):
+                import whisper
+                whisper.load_model(model_size, device="cpu", download_root=whisper_dir)
+                results.append(label)
+
         if include_faster_whisper:
-            fw_repo = manifest.whisper_map.get(model_size)
-            if not fw_repo:
-                fw_repo = f"Systran/faster-whisper-{model_size}"
-                print(f"Warning: {model_size} not in manifest. Trying: {fw_repo}")
-            _do_download(fw_repo)
+            repo_id = manifest.whisper_map.get(model_size)
+            if repo_id:
+                download_snapshot(repo_id)
+            else:
+                # Faster Whisper resolves aliases such as "large" using its installed model map.
+                with attempt(f"Faster Whisper: {model_size}"):
+                    from faster_whisper.utils import download_model
+                    results.append(download_model(model_size, cache_dir=hf_dir))
 
-        # C. Alignment
         if include_alignment:
+            label = "WhisperX English alignment"
+            with attempt(label):
+                import whisperx
+                whisperx.load_align_model(language_code="en", device="cpu", model_dir=hf_dir)
+                results.append(label)
             for repo in manifest.alignment_repos:
-                _do_download(repo)
+                download_snapshot(repo)
 
-        # D. Translation
         if include_m2m100:
-            repos_to_dl = [specific_translation_repo] if specific_translation_repo else manifest.translation_repos[:1]
-            for repo in repos_to_dl:
-                _do_download(repo)
+            download_snapshot(specific_translation_repo or DEFAULT_TRANSLATION_REPO)
 
+        if failures:
+            raise RuntimeError("Prefetch failed:\n" + "\n".join(failures))
         return results
 
     # 通用下载方法 (保留，但也修复延迟引用)
@@ -240,24 +218,46 @@ class ModelDownloader:
             return self._download_from_hf(source, filename, save_dir, repo_type)
 
     def _download_from_url(self, url, save_dir, filename=None):
+        import requests
+        from tqdm import tqdm
+
         if not filename:
             filename = os.path.basename(urlparse(url).path)
         file_path = os.path.join(save_dir, filename)
         first_byte = os.path.getsize(file_path) if os.path.exists(file_path) else 0
-        header = {"Range": f"bytes={first_byte}-"}
+        headers = {"Accept-Encoding": "identity"}
+        if first_byte:
+            headers["Range"] = f"bytes={first_byte}-"
         try:
             print(f"Downloading URL: {url}")
-            response = requests.get(url, headers=header, stream=True, proxies=self.proxies, timeout=60)
-            if response.status_code == 416: 
-                return file_path
-            total_size = int(response.headers.get('content-length', 0)) + first_byte
-            mode = 'ab' if first_byte > 0 else 'wb'
-            with open(file_path, mode) as f:
-                with tqdm(total=total_size, unit='B', unit_scale=True, initial=first_byte) as pbar:
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
+            with requests.get(url, headers=headers, stream=True, proxies=self.proxies, timeout=60) as response:
+                content_range = response.headers.get("Content-Range", "")
+                if response.status_code == 416 and os.path.isfile(file_path) and content_range == f"bytes */{first_byte}":
+                    return file_path
+                response.raise_for_status()
+
+                if response.status_code == 206:
+                    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range)
+                    if not match:
+                        raise ValueError(f"Invalid Content-Range: {content_range!r}")
+                    start, end, total_size = map(int, match.groups())
+                    if start != first_byte or end < start or end != total_size - 1:
+                        raise ValueError(f"Unexpected Content-Range: {content_range!r}")
+                elif response.status_code == 200:
+                    # The server may ignore Range and return the entire file.
+                    first_byte = 0
+                    length = response.headers.get("Content-Length")
+                    total_size = int(length) if length and not response.headers.get("Content-Encoding") else None
+                else:
+                    raise ValueError(f"Unexpected HTTP status {response.status_code}")
+
+                with open(file_path, "ab" if first_byte else "wb") as f:
+                    with tqdm(total=total_size, unit="B", unit_scale=True, initial=first_byte) as progress:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
                             f.write(chunk)
-                            pbar.update(len(chunk))
+                            progress.update(len(chunk))
+                    if total_size is not None and f.tell() != total_size:
+                        raise OSError(f"Incomplete download: expected {total_size} bytes, got {f.tell()}")
             return file_path
         except Exception as e:
             print(f"URL Download failed: {e}")
@@ -276,10 +276,7 @@ class ModelDownloader:
                     repo_id=repo_id,
                     filename=filename,
                     repo_type=repo_type,
-                    local_dir=save_dir,
-                    local_dir_use_symlinks=False,
-                    resume_download=True,
-                    proxies=self.proxies
+                    local_dir=save_dir
                 )
                 return path
             else:
@@ -287,8 +284,7 @@ class ModelDownloader:
                     repo_id=repo_id, 
                     revision="main", 
                     cache_dir=save_dir, 
-                    repo_type=repo_type, 
-                    proxies=self.proxies
+                    repo_type=repo_type
                 )
                 return path
         except Exception as e:

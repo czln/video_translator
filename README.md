@@ -27,6 +27,9 @@ python -m video_translator path/to/video.mp4 --model small --lang fr
 
 # specify output SRT file
 python -m video_translator path/to/video.mp4 --lang es -o subs.es.srt
+
+# prefetch the selected model size and default translation/alignment models
+python -m video_translator --download-models --model small --model-cache-dir ./models
 ```
 
 Notes
@@ -36,7 +39,7 @@ Notes
 
 Files
 - `video_translator/cli.py` — CLI entrypoint and audio extraction
-	- `--src-lang`: supply source speech language code (e.g. `en`) to improve transcription accuracy.
+	- `--src-lang`: supply the source speech language (e.g. `en`). Offline translation uses the language detected during transcription when this option is omitted.
 	- `--transcriber`: choose the transcription backend: `whisper`, `whisperx`, or `mixed` (default `mixed`).
 	- `--translator-mode`: choose translation backend or specific model. Examples:
 	  - `online` — uses `deep-translator`'s `GoogleTranslator`.
@@ -45,9 +48,9 @@ Files
 	  - `m2m100_1.2B`, `m2m100_418M` — select a specific M2M100 variant (maps to `facebook/m2m100_<variant>`).
 	  - `model:facebook/m2m100_1.2B` — pass an explicit Hugging Face repo id to use as the model.
 	- `--proxy`: when using `--translator-mode online`, set an HTTP(S) proxy (e.g. `http://127.0.0.1:8080`).
-	- `--timeout`: per-segment translation timeout in seconds (default `10.0`).
+	- `--timeout`: per-segment translation timeout in seconds (default `10.0`). A timeout or provider error exits with a failure. Rerunning reuses the transcript and retries translation.
 	- `--device`: select device for Whisper: `auto` (default), `cpu`, or `cuda[:<index>]` (e.g. `cuda:0`).
-	- `--cache-dir`: optional directory to store transcript/translation cache files. If omitted caches are stored beside the source video file.
+	- `--cache-dir`: optional shared directory for extracted audio, transcripts and translations. Without it, transcripts and translations are stored beside the video and extracted audio is temporary. Replacing the source or using `--force` triggers fresh extraction. Caches from earlier versions are rebuilt once.
 	- `--model-cache-dir`: optional directory where Hugging Face/Whisper models will be downloaded and cached. When provided, the CLI exports `HF_HOME`, `TRANSFORMERS_CACHE`, and `TORCH_HOME` to point into this directory so downstream loaders reuse the cache.
 	- `--hf-mirror`: optional Hugging Face mirror endpoint (sets `HF_ENDPOINT`) to speed up model downloads behind mirrors.
 	- `--auto-install-argos`: when using `--translator-mode offline`, automatically attempt to download and install an Argos Translate language package for the requested language pair. If not set and no package is installed, the program will exit with an error.
