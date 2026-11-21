@@ -1,31 +1,15 @@
-from typing import List, Dict, Optional, Any
-import os
 import concurrent.futures
+import json
+import math
+import os
+import queue
+import subprocess
+import sys
+import threading
 import time
 from abc import ABC, abstractmethod
-import sys
+from typing import Dict, List, Optional
 
-# --- Proxy Utilities ---
-
-def _use_proxy_env(proxy: Optional[str]):
-    """Set HTTP(S)_PROXY env vars, return previous values."""
-    prev_http = os.environ.get('HTTP_PROXY')
-    prev_https = os.environ.get('HTTPS_PROXY')
-    if proxy:
-        os.environ['HTTP_PROXY'] = proxy
-        os.environ['HTTPS_PROXY'] = proxy
-    return prev_http, prev_https
-
-
-def _restore_proxy_env(prev_http, prev_https):
-    if prev_http is None:
-        os.environ.pop('HTTP_PROXY', None)
-    else:
-        os.environ['HTTP_PROXY'] = prev_http
-    if prev_https is None:
-        os.environ.pop('HTTPS_PROXY', None)
-    else:
-        os.environ['HTTPS_PROXY'] = prev_https
 
 def _normalize_lang_code(code: Optional[str]) -> Optional[str]:
     """Helper to normalize language codes (e.g. 'zh-CN' -> 'zh')."""
@@ -124,10 +108,7 @@ class ArgoTranslator(BaseTranslator):
         return obj
 
     def translate(self, text: str) -> str:
-        try:
-            return self.translation_obj.translate(text)
-        except Exception:
-            return str(text or "")
+        return self.translation_obj.translate(text)
 
 class M2M100Translator(BaseTranslator):
     def __init__(self, src_lang: Optional[str], target_lang: str, model_name: str = "facebook/m2m100_418M", device: str = "cpu", model_cache_dir: Optional[str] = None):
@@ -176,119 +157,161 @@ class M2M100Translator(BaseTranslator):
         return self.tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
 
 
-# --- Main Logic ---
+def _make_translator(mode, src_lang, target_lang, proxy, auto_install, device, model_cache_dir):
+    key = mode.lower()
+    if key in ("online", "google"):
+        return DeepGoogleTranslator(src_lang, target_lang, proxy), 8
+    if key in ("offline", "argos"):
+        return ArgoTranslator(src_lang, target_lang, auto_install=auto_install), 4
+
+    models = {
+        "m2m100": "facebook/m2m100_418M",
+        "m2m100_418m": "facebook/m2m100_418M",
+        "m2m100_1.2b": "facebook/m2m100_1.2B",
+    }
+    if key.startswith("model:"):
+        model_name = mode.split(":", 1)[1].strip() or models["m2m100"]
+    elif key in models:
+        model_name = models[key]
+    else:
+        raise ValueError(f"Unknown translation mode: {mode}")
+
+    # A single GPU model must only generate for one segment at a time.
+    return M2M100Translator(src_lang, target_lang, model_name=model_name,
+                            device=device, model_cache_dir=model_cache_dir), 1
+
+
+def _translation_worker():
+    # Keep provider logs (including native code writing to fd 1) off the event pipe.
+    with os.fdopen(os.dup(1), "w", encoding="utf-8") as events:
+        os.dup2(2, 1)
+        lock = threading.Lock()
+
+        def send(*event):
+            with lock:
+                print(json.dumps([time.monotonic(), *event]), file=events, flush=True)
+
+        try:
+            paths, texts, options = json.load(sys.stdin)
+            sys.path[:] = paths
+            translator, workers = _make_translator(**options)
+
+            def translate(item):
+                index, text = item
+                try:
+                    send("started", index)
+                    result = translator.translate(text) if text else ""
+                    if text and (not isinstance(result, str) or not result.strip()):
+                        raise ValueError("provider returned an empty translation")
+                    send("translated", index, result)
+                except Exception as exc:
+                    send("failed", index, str(exc))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(translate, enumerate(texts)))
+        except Exception as exc:
+            send("failed", None, str(exc))
+
+
+def _collect_translations(events, total, timeout):
+    results = [None] * total
+    deadlines = {}
+    completed = 0
+
+    def timeout_error(index):
+        return RuntimeError(f"Translation timed out for segment {index + 1}/{total} after {timeout}s")
+
+    while completed < total:
+        first = min(deadlines, key=deadlines.get, default=None)
+        remaining = None if first is None else max(0, deadlines[first] - time.monotonic())
+        try:
+            line = events.get(timeout=remaining)
+        except queue.Empty:
+            raise timeout_error(first) from None
+        if line is None:
+            raise RuntimeError("Translation worker exited before returning all segments")
+
+        try:
+            timestamp, kind, index, *data = json.loads(line)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Invalid response from translation worker") from exc
+        if first is not None and timestamp > deadlines[first]:
+            raise timeout_error(first)
+        if kind == "failed":
+            where = " during setup" if index is None else f" for segment {index + 1}/{total}"
+            raise RuntimeError(f"Translation failed{where}: {data[0]}")
+        if kind == "started":
+            deadlines[index] = timestamp + timeout
+        elif kind == "translated":
+            del deadlines[index]
+            results[index] = data[0]
+            completed += 1
+            print(f"\rTranslated segment {completed}/{total}", end="", flush=True)
+    return results
+
 
 def translate_segments(
-    segments: List[Dict], 
-    target_lang: str, 
-    mode: str = 'online', 
-    proxy: Optional[str] = None, 
-    timeout: float = 10.0, 
-    src_lang: Optional[str] = None, 
+    segments: List[Dict],
+    target_lang: str,
+    mode: str = 'online',
+    proxy: Optional[str] = None,
+    timeout: float = 10.0,
+    src_lang: Optional[str] = None,
     auto_install: bool = False,
     device: str = 'cpu',
     model_cache_dir: Optional[str] = None
 ) -> List[Dict]:
-    """
-    Translate segments using the specified engine.
-    
-    Args:
-        mode: 'online'/'google', 'offline'/'argos', 'm2m100', or 'model:<repo_id>'.
-        device: 'cpu' or 'cuda' (only used for m2m100).
-    """
-    
-    translator: BaseTranslator = None
-    mode_raw = mode.lower()
-    
-    # Mode parsing:
-    # 1. Default M2M100 model name
-    m2m_model_name = "facebook/m2m100_418M"
+    """Translate each segment within its own deadline, preserving order and metadata."""
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise RuntimeError("Translation timeout must be a positive, finite number of seconds")
+    if not segments:
+        return segments
 
-    # 2. Check for a 'model:' prefix specifying an explicit model
-    if mode_raw.startswith("model:"):
-        # Extract the model name (e.g., model:facebook/m2m100_1.2B -> facebook/m2m100_1.2B)
-        # Do not lower() the repo id (preserve case)
-        parts = mode.split(":", 1)
-        if len(parts) > 1 and parts[1].strip():
-            m2m_model_name = parts[1].strip()
-        # Force the processing mode to 'm2m100'
-        mode_raw = "m2m100"
+    texts = [(segment.get("text") or "").strip() for segment in segments]
+    options = dict(mode=mode, src_lang=src_lang, target_lang=target_lang, proxy=proxy,
+                   auto_install=auto_install, device=device,
+                   model_cache_dir=os.fspath(model_cache_dir) if model_cache_dir else None)
+    env = os.environ.copy()
+    if proxy:
+        env.update(HTTP_PROXY=proxy, HTTPS_PROXY=proxy, http_proxy=proxy, https_proxy=proxy)
+    env["PYTHONIOENCODING"] = "utf-8"
+    # GoogleTranslator has no request-timeout hook. Keep the provider's HTTP behavior
+    # and isolate the batch so a blocked request or native model can be stopped.
+    with subprocess.Popen([sys.executable, __file__], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, encoding="utf-8", env=env) as process:
+        events = queue.Queue()
 
-    # 3. If mode is simply 'm2m100', keep the default 418M model
+        def read_events():
+            try:
+                for line in process.stdout:
+                    events.put(line)
+            finally:
+                events.put(None)
 
-    prev_http, prev_https = _use_proxy_env(proxy)
-    
-    try:
-        # 1. Initialize Translator
-        if mode_raw in ['online', 'google']:
-            translator = DeepGoogleTranslator(src_lang, target_lang, proxy)
-            workers = 8 # IO bound
-        elif mode_raw in ['offline', 'argos']:
-            translator = ArgoTranslator(src_lang, target_lang, auto_install=auto_install)
-            workers = 4 # CPU bound
-        elif mode_raw == 'm2m100':
-            translator = M2M100Translator(src_lang, target_lang, model_name=m2m_model_name, device=device, model_cache_dir=model_cache_dir)
-            # IMPORTANT: Threading with a single GPU model instance causes VRAM contention and errors.
-            # We enforce serial execution (workers=1) for M2M100 to ensure safety and stability.
-            workers = 1 
-        else:
-            raise ValueError(f"Unknown translation mode: {mode}")
+        reader = threading.Thread(target=read_events, daemon=True)
+        reader.start()
+        try:
+            with process.stdin:
+                paths = [path for path in sys.path if isinstance(path, str)]
+                json.dump([paths, texts, options], process.stdin)
+            results = _collect_translations(events, len(texts), timeout)
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        except BrokenPipeError as exc:
+            raise RuntimeError("Translation worker exited during setup") from exc
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            reader.join()
 
-        total = len(segments)
-        
-        # 2. Execute Translation
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = []
-            for i, seg in enumerate(segments):
-                text = seg.get('text', '').strip()
-                if not text:
-                    futures.append(ex.submit(lambda: ""))
-                    continue
-                
-                futures.append(ex.submit(translator.translate, text))
-
-            # 3. Collect Results
-            max_msg_len = 0
-            for idx, fut in enumerate(futures, start=1):
-                try:
-                    start = time.time()
-                    translated = fut.result(timeout=timeout)
-                except concurrent.futures.TimeoutError:
-                    translated = segments[idx-1].get('text')
-                    print(f"Timeout segment {idx}/{total} (>{timeout}s)")
-                except Exception as e:
-                    translated = segments[idx-1].get('text')
-                    print(f"Error segment {idx}/{total}: {e}")
-
-                if translated is None:
-                    translated = ''
-                else:
-                    translated = str(translated)
-
-                segments[idx-1]['translated_text'] = translated
-                
-                # Update progress on the same line without emitting a newline.
-                try:
-                    msg = f"Translated segment {idx}/{total}"
-                    # track max length so we can clear remnants of previous longer messages
-                    if len(msg) > max_msg_len:
-                        max_msg_len = len(msg)
-                    # write carriage return + message + padding to clear previous content
-                    sys.stdout.write('\r' + msg + ' ' * (max_msg_len - len(msg)))
-                    sys.stdout.flush()
-                except Exception:
-                    # best-effort fallback: try print with carriage return, then as last resort print without newline
-                    try:
-                        print(f"Translated segment {idx}/{total}", end='\r', flush=True)
-                    except Exception:
-                        print(f"Translated segment {idx}/{total}", end='')
-
-    finally:
-        _restore_proxy_env(prev_http, prev_https)
-
-    try:
-        print()
-    except Exception:
-        pass
-
+    for segment, translated in zip(segments, results):
+        segment["translated_text"] = translated
+    print()
     return segments
+
+
+if __name__ == "__main__":
+    _translation_worker()
